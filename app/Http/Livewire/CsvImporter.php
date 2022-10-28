@@ -1,0 +1,137 @@
+<?php
+
+namespace App\Http\Livewire;
+
+use League\Csv\Reader;
+use App\Jobs\ImportCsv;
+use Livewire\Component;
+use League\Csv\Statement;
+use Livewire\WithFileUploads;
+use App\Helpers\ChunkIterator;
+use Illuminate\Support\Facades\Bus;
+
+class CsvImporter extends Component
+{
+    use WithFileUploads;
+
+    public bool $open = false;
+
+    public string $model;
+
+    public array $fileHeaders = [];
+
+    public int $fileRowCount = 0;
+
+    public array $columnsToMap = [];
+
+    public array $requiredColumns = [];
+
+    public array $columnLabels = [];
+
+    public $file;
+
+    protected $listeners = [
+        'toggle'
+    ];
+
+    public function mount()
+    {
+        $this->columnsToMap = collect($this->columnsToMap)
+            ->mapWithKeys(fn ($column) => [$column => ""])
+            ->toArray();
+    }
+
+    public function rules()
+    {
+        $columnRules = collect($this->requiredColumns)
+            ->mapWithKeys(function ($column) {
+                return ['columnsToMap.' . $column => ['required']];
+            })
+            ->toArray();
+
+        return array_merge($columnRules, [
+            'file' => ['required', 'mimes:csv', 'max:51200'],
+        ]);
+    }
+
+    public function validationAttributes()
+    {
+        return collect($this->requiredColumns)
+            ->mapWithKeys(function ($column) {
+                return ['columnsToMap.' . $column => $this->columnLabels[$column] ?? $column];
+            })
+            ->toArray();
+    }
+
+    public function updatedFile()
+    {
+        $this->validateOnly('file');
+
+        $csv = $this->readCsv;
+
+        $this->fileHeaders = $csv->getHeader();
+
+        $this->fileRowCount = count($this->csvRecords);
+
+        $this->resetValidation();
+    }
+    public function getReadCsvProperty(): Reader
+    {
+        return $this->readCsv($this->file->getRealPath());
+    }
+
+    public function getCsvRecordsProperty()
+    {
+        return Statement::create()->process($this->readCsv);
+    }
+
+    public function import()
+    {
+        $this->validate();
+
+        $import = $this->createImport();
+
+        $batches = collect((new ChunkIterator($this->csvRecords->getRecords(), 10))
+            ->get())
+            ->map(function ($chunk) use ($import) {
+                return new ImportCsv($import, $this->model, $chunk, $this->columnsToMap);
+            })
+            ->toArray();
+
+        Bus::batch($batches)
+            ->finally(function () use ($import) {
+                $import->touch('completed_at');
+            })
+            ->dispatch();
+    }
+
+    public function createImport()
+    {
+        return auth()->user()->imports()->create([
+            'file_path' => $this->file->getRealPath(),
+            'file_name' => $this->file->getClientOriginalName(),
+            'total_rows' => count($this->csvRecords),
+            'model' => $this->model,
+        ]);
+    }
+
+    protected function readCsv(string $path): Reader
+    {
+        $stream = fopen($path, 'r');
+        $csv = Reader::createFromStream($stream);
+        $csv->setHeaderOffset(0);
+
+        return $csv;
+    }
+
+
+
+    public function toggle()
+    {
+        $this->open = !$this->open;
+    }
+    public function render()
+    {
+        return view('livewire.csv-importer');
+    }
+}
